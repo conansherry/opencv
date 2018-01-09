@@ -139,7 +139,7 @@ public:
     class FullyConnected : public ParallelLoopBody
     {
     public:
-        FullyConnected() : srcMat(0), weights(0), biasMat(0), activ(0), dstMat(0), nstripes(0), useAVX(false), useAVX2(false) {}
+        FullyConnected() : srcMat(0), weights(0), biasMat(0), activ(0), dstMat(0), nstripes(0), useAVX(false), useAVX2(false), useAVX512(false) {}
 
         static void run(const Mat& srcMat, const Mat& weights, const Mat& biasMat,
                         Mat& dstMat, const ActivationLayer* activ, int nstripes)
@@ -161,6 +161,7 @@ public:
             p.activ = activ;
             p.useAVX = checkHardwareSupport(CPU_AVX);
             p.useAVX2 = checkHardwareSupport(CPU_AVX2);
+            p.useAVX512 = CV_CPU_HAS_SUPPORT_AVX512_SKX;
 
             parallel_for_(Range(0, nstripes), p, nstripes);
         }
@@ -195,6 +196,11 @@ public:
 
                 memcpy(sptr, sptr_, vecsize*sizeof(sptr[0]));
 
+            #if CV_TRY_AVX512_SKX
+                if( useAVX512 )
+                    opt_AVX512_SKX::fastGEMM1T( sptr, wptr, wstep, biasptr, dptr, nw, vecsize);
+                else
+            #endif
             #if CV_TRY_AVX2
                 if( useAVX2 )
                     opt_AVX2::fastGEMM1T( sptr, wptr, wstep, biasptr, dptr, nw, vecsize);
@@ -255,6 +261,7 @@ public:
         int nstripes;
         bool useAVX;
         bool useAVX2;
+        bool useAVX512;
     };
 
 #ifdef HAVE_OPENCL
@@ -286,8 +293,13 @@ public:
         UMat biasOnesMat = UMat::ones(outerSize, 1, umat_blobs[0].type());
         for (size_t i = 0; i < inputs.size(); i++)
         {
-            UMat& srcMat = inputs[i];
-            UMat& dstMat = outputs[i];
+            MatShape inshape, outshape;
+            inshape = shape(outerSize, innerSize);
+            outshape = shape(outerSize, numOutput);
+
+            UMat srcMat, dstMat;
+            srcMat = inputs[i].reshape(1, inshape.size(), &inshape[0]);
+            dstMat = outputs[i].reshape(1, outshape.size(), &outshape[0]);
             dstMat.setTo(0.0f);
 
             if (!innerProductOp->Forward(srcMat, umat_blobs[0], (bias) ? umat_blobs[1] : UMat(), dstMat))
@@ -392,7 +404,7 @@ public:
         int innerSize = blobs[0].size[1];
         for(int i = 0; i < outputs.size(); i++)
         {
-            flops += 3*innerSize*total(outputs[i]);
+            flops += CV_BIG_INT(3)*innerSize*total(outputs[i]);
         }
 
         return flops;

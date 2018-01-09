@@ -2629,7 +2629,7 @@ public:
 
     /** @overload
     initializes an empty SVD structure and then calls SVD::operator()
-    @param src decomposed matrix.
+    @param src decomposed matrix. The depth has to be CV_32F or CV_64F.
     @param flags operation flags (SVD::Flags)
       */
     SVD( InputArray src, int flags = 0 );
@@ -2642,7 +2642,7 @@ public:
     different matrices. Each time, if needed, the previous u,`vt` , and w
     are reclaimed and the new matrices are created, which is all handled by
     Mat::create.
-    @param src decomposed matrix.
+    @param src decomposed matrix. The depth has to be CV_32F or CV_64F.
     @param flags operation flags (SVD::Flags)
       */
     SVD& operator ()( InputArray src, int flags = 0 );
@@ -2658,18 +2658,18 @@ public:
     SVD::compute(A, w, u, vt);
     @endcode
 
-    @param src decomposed matrix
+    @param src decomposed matrix. The depth has to be CV_32F or CV_64F.
     @param w calculated singular values
     @param u calculated left singular vectors
-    @param vt transposed matrix of right singular values
-    @param flags operation flags - see SVD::SVD.
+    @param vt transposed matrix of right singular vectors
+    @param flags operation flags - see SVD::Flags.
       */
     static void compute( InputArray src, OutputArray w,
                          OutputArray u, OutputArray vt, int flags = 0 );
 
     /** @overload
     computes singular values of a matrix
-    @param src decomposed matrix
+    @param src decomposed matrix. The depth has to be CV_32F or CV_64F.
     @param w calculated singular values
     @param flags operation flags - see SVD::Flags.
       */
@@ -3093,13 +3093,18 @@ public:
     */
     virtual void write(FileStorage& fs) const { (void)fs; }
 
+    /** @brief simplified API for language bindings
+     * @overload
+     */
+    CV_WRAP void write(const Ptr<FileStorage>& fs, const String& name = String()) const;
+
     /** @brief Reads algorithm parameters from a file storage
     */
-    virtual void read(const FileNode& fn) { (void)fn; }
+    CV_WRAP virtual void read(const FileNode& fn) { (void)fn; }
 
     /** @brief Returns true if the Algorithm is empty (e.g. in the very beginning or after unsuccessful read
      */
-    virtual bool empty() const { return false; }
+    CV_WRAP virtual bool empty() const { return false; }
 
     /** @brief Reads algorithm from the file node
 
@@ -3134,6 +3139,7 @@ public:
     template<typename _Tp> static Ptr<_Tp> load(const String& filename, const String& objname=String())
     {
         FileStorage fs(filename, FileStorage::READ);
+        CV_Assert(fs.isOpened());
         FileNode fn = objname.empty() ? fs.getFirstTopLevelNode() : fs[objname];
         if (fn.empty()) return Ptr<_Tp>();
         Ptr<_Tp> obj = _Tp::create();

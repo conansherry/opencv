@@ -51,9 +51,14 @@
 #include <opencv2/dnn/shape_utils.hpp>
 #include <opencv2/imgproc.hpp>
 
+#include <opencv2/core/utils/configuration.private.hpp>
+
 namespace cv {
 namespace dnn {
 CV__DNN_EXPERIMENTAL_NS_BEGIN
+
+// this option is usefull to run valgrind memory errors detection
+static bool DNN_DISABLE_MEMORY_OPTIMIZATIONS = utils::getConfigurationParameterBool("OPENCV_DNN_DISABLE_MEMORY_OPTIMIZATIONS", false);
 
 using std::vector;
 using std::map;
@@ -84,11 +89,11 @@ static String toString(const T &v)
     return ss.str();
 }
 
-Mat blobFromImage(const Mat& image, double scalefactor, const Size& size,
+Mat blobFromImage(InputArray image, double scalefactor, const Size& size,
                   const Scalar& mean, bool swapRB, bool crop)
 {
     CV_TRACE_FUNCTION();
-    std::vector<Mat> images(1, image);
+    std::vector<Mat> images(1, image.getMat());
     return blobFromImages(images, scalefactor, size, mean, swapRB, crop);
 }
 
@@ -108,14 +113,14 @@ Mat blobFromImages(const std::vector<Mat>& images_, double scalefactor, Size siz
             {
               float resizeFactor = std::max(size.width / (float)imgSize.width,
                                             size.height / (float)imgSize.height);
-              resize(images[i], images[i], Size(), resizeFactor, resizeFactor);
+              resize(images[i], images[i], Size(), resizeFactor, resizeFactor, INTER_LINEAR);
               Rect crop(Point(0.5 * (images[i].cols - size.width),
                               0.5 * (images[i].rows - size.height)),
                         size);
               images[i] = images[i](crop);
             }
             else
-              resize(images[i], images[i], size);
+              resize(images[i], images[i], size, 0, 0, INTER_LINEAR);
         }
         if(images[i].depth() == CV_8U)
             images[i].convertTo(images[i], CV_32F);
@@ -279,6 +284,16 @@ struct DataLayer : public Layer
         outNames.assign(names.begin(), names.end());
     }
 
+    bool getMemoryShapes(const std::vector<MatShape> &inputs,
+                         const int requiredOutputs,
+                         std::vector<MatShape> &outputs,
+                         std::vector<MatShape> &internals) const
+    {
+        CV_Assert(inputs.size() == requiredOutputs);
+        outputs.assign(inputs.begin(), inputs.end());
+        return false;
+    }
+
 private:
     std::vector<String> outNames;
 };
@@ -357,13 +372,13 @@ public:
         }
     }
 
-    void reuseOrCreate(const MatShape& shape, const LayerPin& lp, Mat& dst, bool force)
+    void reuseOrCreate(const MatShape& shape, const LayerPin& lp, Mat& dst)
     {
-        Mat bestBlob;
-        LayerPin bestBlobPin;
-
-        if( !force )
+        if (!DNN_DISABLE_MEMORY_OPTIMIZATIONS)
         {
+            Mat bestBlob;
+            LayerPin bestBlobPin;
+
             std::map<LayerPin, Mat>::iterator hostIt;
             std::map<LayerPin, int>::iterator refIt;
 
@@ -387,13 +402,14 @@ public:
                     }
                 }
             }
+            if (!bestBlob.empty())
+            {
+                reuse(bestBlobPin, lp);
+                dst = bestBlob.reshape(1, 1).colRange(0, targetTotal).reshape(1, shape);
+                return;
+            }
         }
-        if (!bestBlob.empty())
-        {
-            reuse(bestBlobPin, lp);
-            dst = Mat(shape, CV_32F, bestBlob.data);
-        }
-        else
+
         {
             // if dst already has been allocated with total(shape) elements,
             // it won't be recrreated and pointer of dst.data remains the same.
@@ -402,13 +418,13 @@ public:
         }
     }
 
-    void reuseOrCreate(const MatShape& shape, const LayerPin& lp, UMat &umat_dst, bool force)
+    void reuseOrCreate(const MatShape& shape, const LayerPin& lp, UMat &umat_dst)
     {
-        UMat bestBlob;
-        LayerPin bestBlobPin;
-
-        if( !force )
+        if (!DNN_DISABLE_MEMORY_OPTIMIZATIONS)
         {
+            UMat bestBlob;
+            LayerPin bestBlobPin;
+
             std::map<LayerPin, UMat>::iterator hostIt;
             std::map<LayerPin, int>::iterator refIt;
 
@@ -432,13 +448,14 @@ public:
                     }
                 }
             }
+            if (!bestBlob.empty())
+            {
+                reuse(bestBlobPin, lp);
+                umat_dst.create(shape, CV_32F);
+                return;
+            }
         }
-        if (!bestBlob.empty())
-        {
-            reuse(bestBlobPin, lp);
-            umat_dst.create(shape, CV_32F);
-        }
-        else
+
         {
             // if dst already has been allocated with total(shape) elements,
             // it won't be recrreated and pointer of dst.data remains the same.
@@ -448,8 +465,7 @@ public:
     }
 
     void allocateBlobsForLayer(LayerData &ld, const LayerShapes& layerShapes,
-                               std::vector<LayerPin>& pinsForInternalBlobs,
-                               bool maximizeReuse)
+                               std::vector<LayerPin>& pinsForInternalBlobs)
     {
         CV_TRACE_FUNCTION();
         bool use_umat = (preferableBackend == DNN_BACKEND_DEFAULT &&
@@ -520,7 +536,6 @@ public:
         }
 
         std::map<int, std::vector<int> >::reverse_iterator it;
-        bool force = !maximizeReuse && ld.inputBlobsId.size() > 1;
         for(it = idxSizes.rbegin(); it != idxSizes.rend(); it++)
         {
             for(int j = 0; j < it->second.size(); j++)
@@ -529,7 +544,7 @@ public:
                 if (total(shapes[index]))
                 {
                     LayerPin blobPin(ld.id, index);
-                    if (index < outShapes.size() && inPlace && !force)
+                    if (index < outShapes.size() && inPlace)
                     {
                         if (use_umat)
                         {
@@ -548,9 +563,9 @@ public:
                     else
                     {
                         if (use_umat)
-                            reuseOrCreate(shapes[index], blobPin, *umat_blobs[index], force);
+                            reuseOrCreate(shapes[index], blobPin, *umat_blobs[index]);
                         else
-                            reuseOrCreate(shapes[index], blobPin, *blobs[index], force);
+                            reuseOrCreate(shapes[index], blobPin, *blobs[index]);
                     }
                 }
             }
@@ -645,6 +660,8 @@ struct Net::Impl
         fusion = true;
         preferableBackend = DNN_BACKEND_DEFAULT;
         preferableTarget = DNN_TARGET_CPU;
+        blobManager.setPreferableBackend(DNN_BACKEND_DEFAULT);
+        blobManager.setPreferableTarget(DNN_TARGET_CPU);
     }
 
     Ptr<DataLayer> netInputLayer;
@@ -1099,8 +1116,7 @@ struct Net::Impl
         CV_Assert(layerShapesIt != layersShapes.end());
 
         std::vector<LayerPin> pinsForInternalBlobs;
-        bool maximizeReuse = preferableBackend == DNN_BACKEND_HALIDE;
-        blobManager.allocateBlobsForLayer(ld, layerShapesIt->second, pinsForInternalBlobs, maximizeReuse);
+        blobManager.allocateBlobsForLayer(ld, layerShapesIt->second, pinsForInternalBlobs);
         ld.outputBlobsWrappers.resize(ld.outputBlobs.size());
         for (int i = 0; i < ld.outputBlobs.size(); ++i)
         {
@@ -1111,13 +1127,13 @@ struct Net::Impl
         {
             if (use_umat)
             {
+                std::vector<Mat> input_mats(ld.umat_inputBlobs.size());;
                 std::vector<Mat*> inputs(ld.umat_inputBlobs.size());;
                 std::vector<Mat> outputs(ld.umat_outputBlobs.size());
-                Mat mat;
                 for (int i = 0; i < inputs.size(); i++)
                 {
-                    mat = ld.umat_inputBlobs[i].getMat(ACCESS_READ);
-                    inputs[i] = &mat;
+                    input_mats[i] = ld.umat_inputBlobs[i].getMat(ACCESS_READ);
+                    inputs[i] = &input_mats[i];
                 }
                 for (int i = 0; i < outputs.size(); i++)
                 {
@@ -1186,7 +1202,8 @@ struct Net::Impl
             // some other layers.
 
             // TODO: OpenCL target support more fusion styles.
-            if ( preferableTarget == DNN_TARGET_OPENCL && ld.layerInstance->type.compare("Convolution") )
+            if ( preferableTarget == DNN_TARGET_OPENCL &&
+                 (!cv::ocl::useOpenCL() || ld.layerInstance->type.compare("Convolution")) )
                 continue;
 
             Ptr<Layer>& currLayer = ld.layerInstance;
@@ -1204,7 +1221,10 @@ struct Net::Impl
                     {
                         printf_(("\tfused with %s\n", nextBNormLayer->name.c_str()));
                         bnormData->skipFlags[DNN_BACKEND_DEFAULT] = true;
-                        ld.outputBlobs = layers[lpNext.lid].outputBlobs;
+                        if ( preferableTarget == DNN_TARGET_OPENCL )
+                            ld.umat_outputBlobs = layers[lpNext.lid].umat_outputBlobs;
+                        else
+                            ld.outputBlobs = layers[lpNext.lid].outputBlobs;
                         if( bnormData->consumers.size() == 1 )
                         {
                             nextData = &layers[bnormData->consumers[0].lid];
@@ -1224,7 +1244,10 @@ struct Net::Impl
                     {
                         printf_(("\tfused with %s\n", nextScaleLayer->name.c_str()));
                         scaleData->skipFlags[DNN_BACKEND_DEFAULT] = true;
-                        ld.outputBlobs = layers[lpNext.lid].outputBlobs;
+                        if ( preferableTarget == DNN_TARGET_OPENCL )
+                            ld.umat_outputBlobs = layers[lpNext.lid].umat_outputBlobs;
+                        else
+                            ld.outputBlobs = layers[lpNext.lid].outputBlobs;
                         if( scaleData->consumers.size() == 1 )
                         {
                             nextData = &layers[scaleData->consumers[0].lid];
@@ -1233,12 +1256,13 @@ struct Net::Impl
                     }
                 }
 
-                // For now,  OpenCL target only support fusion with activation of ReLU/ChannelsPReLU
+                // For now,  OpenCL target only support fusion with activation of ReLU/ChannelsPReLU/Power
                 if ( preferableTarget != DNN_TARGET_OPENCL ||
                         (preferableTarget == DNN_TARGET_OPENCL &&
                          nextData &&
                         (!nextData->type.compare("ReLU") ||
-                         !nextData->type.compare("ChannelsPReLU"))) )
+                         !nextData->type.compare("ChannelsPReLU") ||
+                         !nextData->type.compare("Power"))) )
                 {
 
                     Ptr<ActivationLayer> nextActivLayer;
@@ -1252,7 +1276,82 @@ struct Net::Impl
                         LayerData *activData = nextData;
                         printf_(("\tfused with %s\n", nextActivLayer->name.c_str()));
                         activData->skipFlags[DNN_BACKEND_DEFAULT] = true;
-                        ld.outputBlobs = layers[lpNext.lid].outputBlobs;
+                        if ( preferableTarget == DNN_TARGET_OPENCL )
+                            ld.umat_outputBlobs = layers[lpNext.lid].umat_outputBlobs;
+                        else
+                            ld.outputBlobs = layers[lpNext.lid].outputBlobs;
+
+                        if ( preferableTarget == DNN_TARGET_OPENCL )
+                        {
+                            nextData = &layers[activData->consumers[0].lid];
+                            lpNext = LayerPin(activData->consumers[0].lid, 0);
+                        }
+                    }
+                }
+
+                // fuse convlution layer followed by eltwise + relu
+                if ( preferableTarget == DNN_TARGET_OPENCL )
+                {
+                    Ptr<EltwiseLayer> nextEltwiseLayer;
+                    if( nextData )
+                        nextEltwiseLayer = nextData->layerInstance.dynamicCast<EltwiseLayer>();
+
+                    if( !nextEltwiseLayer.empty() && pinsToKeep.count(lpNext) == 0 )
+                    {
+                        LayerData *eltwiseData = nextData;
+                        // go down from the second input and find the first non-skipped layer.
+                        LayerData *downLayerData = &layers[eltwiseData->inputBlobsId[1].lid];
+                        while (downLayerData->skipFlags[DNN_BACKEND_DEFAULT])
+                        {
+                            downLayerData = &layers[downLayerData->inputBlobsId[0].lid];
+                        }
+
+                        // second input layer is current layer.
+                        if ( ld.id == downLayerData->id )
+                        {
+                            // go down from the first input and find the first non-skipped layer
+                            downLayerData = &layers[eltwiseData->inputBlobsId[0].lid];
+                            while (downLayerData->skipFlags[DNN_BACKEND_DEFAULT])
+                            {
+                                if ( !downLayerData->type.compare("Eltwise") )
+                                    downLayerData = &layers[downLayerData->inputBlobsId[1].lid];
+                                else
+                                    downLayerData = &layers[downLayerData->inputBlobsId[0].lid];
+                            }
+
+                            Ptr<ConvolutionLayer> convLayer;
+                            if( downLayerData )
+                                convLayer = downLayerData->layerInstance.dynamicCast<ConvolutionLayer>();
+
+                            //  first input layer is convolution layer
+                            if( !convLayer.empty() )
+                            {
+                                // fuse eltwise + activation layer
+                                LayerData *firstConvLayerData = downLayerData;
+                                {
+                                    nextData = &layers[eltwiseData->consumers[0].lid];
+                                    lpNext = LayerPin(eltwiseData->consumers[0].lid, 0);
+                                    Ptr<ActivationLayer> nextActivLayer;
+                                    if( nextData )
+                                        nextActivLayer = nextData->layerInstance.dynamicCast<ActivationLayer>();
+
+                                    if( !nextActivLayer.empty() && pinsToKeep.count(lpNext) == 0 &&
+                                            (!nextData->type.compare("ReLU") ||
+                                             !nextData->type.compare("ChannelsPReLU") ||
+                                             !nextData->type.compare("Power")) &&
+                                            currLayer->setActivation(nextActivLayer) )
+                                    {
+                                        CV_Assert(firstConvLayerData->umat_outputBlobs.size() == 1 && ld.umat_inputBlobs.size() == 1);
+                                        ld.umat_inputBlobs.push_back(firstConvLayerData->umat_outputBlobs[0]);
+                                        printf_(("\tfused with %s\n", nextEltwiseLayer->name.c_str()));
+                                        printf_(("\tfused with %s\n", nextActivLayer->name.c_str()));
+                                        eltwiseData->skipFlags[DNN_BACKEND_DEFAULT] = true;
+                                        nextData->skipFlags[DNN_BACKEND_DEFAULT] = true;
+                                        ld.umat_outputBlobs = layers[lpNext.lid].umat_outputBlobs;
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1303,7 +1402,8 @@ struct Net::Impl
                         LayerPin pin = ld.inputBlobsId[i];
                         LayerData* inp_i_data = &layers[pin.lid];
                         while(inp_i_data->skipFlags[DNN_BACKEND_DEFAULT] &&
-                              inp_i_data->inputBlobsId.size() == 1)
+                              inp_i_data->inputBlobsId.size() == 1 &&
+                              inp_i_data->consumers.size() == 1)
                         {
                             pin = inp_i_data->inputBlobsId[0];
                             inp_i_data = &layers[pin.lid];
@@ -1312,13 +1412,16 @@ struct Net::Impl
                                layers[ld.inputBlobsId[i].lid].getLayerInstance()->name.c_str(),
                                inp_i_data->getLayerInstance()->name.c_str()));
 
-                        if(inp_i_data->skipFlags[DNN_BACKEND_DEFAULT])
+                        if(inp_i_data->skipFlags[DNN_BACKEND_DEFAULT] || inp_i_data->consumers.size() != 1)
                             break;
                         realinputs[i] = pin;
                     }
 
                     if( i >= ninputs )
                     {
+                        // Allocate new memory to prevent collisions during memory
+                        // reusing (see https://github.com/opencv/opencv/pull/10456).
+                        output = output.clone();
                         Range chrange[] = { Range::all(), Range::all(), Range::all(), Range::all() };
                         int ofs = 0;
                         for( i = 0; i < ninputs; i++ )
@@ -1333,7 +1436,11 @@ struct Net::Impl
                             Mat output_slice = output(chrange);
                             Mat& curr_output = inp_i_data->outputBlobs[pin.oid];
                             CV_Assert(output_slice.isContinuous() && output_slice.size == curr_output.size);
+                            Mat* oldPtr = &curr_output;
                             curr_output = output_slice;
+                            // Layers that refer old input Mat will refer to the
+                            // new data but the same Mat object.
+                            CV_Assert(curr_output.data == output_slice.data, oldPtr == &curr_output);
                         }
                         ld.skipFlags[DNN_BACKEND_DEFAULT] = true;
                         printf_(("\toptimized out Concat layer %s\n", concatLayer->name.c_str()));
@@ -1365,7 +1472,9 @@ struct Net::Impl
         blobManager.setPreferableTarget(preferableTarget);
         blobManager.setPreferableBackend(preferableBackend);
         backendWrappers.clear();
-        blobManager.addReference(LayerPin(0, 0));
+        // Fake references to input blobs.
+        for (int i = 0; i < layers[0].outputBlobs.size(); ++i)
+            blobManager.addReference(LayerPin(0, i));
         for (it = layers.begin(); it != layers.end(); ++it)
         {
             const LayerData& ld = it->second;
@@ -1545,7 +1654,7 @@ struct Net::Impl
             CV_Error(Error::StsOutOfRange, "Layer \"" + ld.name + "\" produce only " + toString(ld.outputBlobs.size()) +
                                            " outputs, the #" + toString(pin.oid) + " was requsted");
         }
-        if (preferableBackend != DNN_TARGET_CPU)
+        if (preferableBackend != DNN_BACKEND_DEFAULT)
         {
             // Transfer data to CPU if it's require.
             ld.outputBlobsWrappers[pin.oid]->copyToHost();
@@ -1561,9 +1670,34 @@ struct Net::Impl
         return ld.outputBlobs[pin.oid];
     }
 
+    void getBlob(UMat& umat, const LayerPin& pin)
+    {
+        CV_TRACE_FUNCTION();
+
+        if (!pin.valid())
+            CV_Error(Error::StsObjectNotFound, "Requested blob not found");
+
+        LayerData &ld = layers[pin.lid];
+        if ((size_t)pin.oid >= ld.outputBlobs.size())
+        {
+            CV_Error(Error::StsOutOfRange, "Layer \"" + ld.name + "\" produce only " + toString(ld.outputBlobs.size()) +
+                                           " outputs, the #" + toString(pin.oid) + " was requsted");
+        }
+
+        if (ld.umat_outputBlobs.size() > 0 && !ld.umat_outputBlobs[pin.oid].empty())
+            umat = ld.umat_outputBlobs[pin.oid];
+        else
+            umat = UMat();
+    }
+
     Mat getBlob(String outputName)
     {
         return getBlob(getPinByAlias(outputName));
+    }
+
+    void getBlob(UMat& umat, String outputName)
+    {
+        getBlob(umat, getPinByAlias(outputName));
     }
 };
 
@@ -1642,7 +1776,7 @@ Mat Net::forward(const String& outputName)
     return impl->getBlob(layerName);
 }
 
-void Net::forward(std::vector<Mat>& outputBlobs, const String& outputName)
+void Net::forward(OutputArrayOfArrays outputBlobs, const String& outputName)
 {
     CV_TRACE_FUNCTION();
 
@@ -1658,16 +1792,40 @@ void Net::forward(std::vector<Mat>& outputBlobs, const String& outputName)
     LayerPin pin = impl->getPinByAlias(layerName);
     LayerData &ld = impl->layers[pin.lid];
 
-    if (ld.umat_outputBlobs.size() > 0)
+    if (outputBlobs.isUMat())
     {
-        for (int i = 0; i < ld.umat_outputBlobs.size(); i++)
-            ld.umat_outputBlobs[i].copyTo(ld.outputBlobs[i]);
+        if (ld.umat_outputBlobs.size() > 0)
+        {
+            UMat umat;
+            impl->getBlob(umat, layerName);
+            outputBlobs.assign(umat);
+        }
     }
-
-    outputBlobs = ld.outputBlobs;
+    else if (outputBlobs.isMat())
+    {
+        outputBlobs.assign(impl->getBlob(layerName));
+    }
+    else if (outputBlobs.isMatVector())
+    {
+        if (ld.umat_outputBlobs.size() > 0)
+        {
+            for (int i = 0; i < ld.umat_outputBlobs.size(); i++)
+                ld.umat_outputBlobs[i].copyTo(ld.outputBlobs[i]);
+        }
+        std::vector<Mat> & outputvec = *(std::vector<Mat> *)outputBlobs.getObj();
+        outputvec = ld.outputBlobs;
+    }
+    else if (outputBlobs.isUMatVector())
+    {
+        if (ld.umat_outputBlobs.size() > 0)
+        {
+            std::vector<UMat> & outputvec = *(std::vector<UMat> *)outputBlobs.getObj();
+            outputvec = ld.umat_outputBlobs;
+        }
+    }
 }
 
-void Net::forward(std::vector<Mat>& outputBlobs,
+void Net::forward(OutputArrayOfArrays outputBlobs,
                   const std::vector<String>& outBlobNames)
 {
     CV_TRACE_FUNCTION();
@@ -1675,7 +1833,7 @@ void Net::forward(std::vector<Mat>& outputBlobs,
     std::vector<LayerPin> pins;
     for (int i = 0; i < outBlobNames.size(); i++)
     {
-       pins.push_back(impl->getPinByAlias(outBlobNames[i]));
+        pins.push_back(impl->getPinByAlias(outBlobNames[i]));
     }
 
     impl->setUpNet(pins);
@@ -1684,11 +1842,14 @@ void Net::forward(std::vector<Mat>& outputBlobs,
 
     impl->forwardToLayer(impl->getLayerData(out.lid));
 
-    outputBlobs.clear();
+    std::vector<Mat> matvec;
     for (int i = 0; i < pins.size(); i++)
     {
-        outputBlobs.push_back(impl->getBlob(pins[i]));
+        matvec.push_back(impl->getBlob(pins[i]));
     }
+
+    std::vector<Mat> & outputvec = *(std::vector<Mat> *)outputBlobs.getObj();
+    outputvec = matvec;
 }
 
 void Net::forward(std::vector<std::vector<Mat> >& outputBlobs,
@@ -1755,7 +1916,7 @@ void Net::setInputsNames(const std::vector<String> &inputBlobNames)
     impl->netInputLayer->setNames(inputBlobNames);
 }
 
-void Net::setInput(const Mat &blob_, const String& name)
+void Net::setInput(InputArray blob, const String& name)
 {
     CV_TRACE_FUNCTION();
     CV_TRACE_ARG_VALUE(name, "name", name.c_str());
@@ -1775,6 +1936,7 @@ void Net::setInput(const Mat &blob_, const String& name)
         ld.umat_outputBlobs.resize( std::max(pin.oid+1, (int)ld.requiredOutputs.size()) );
     ld.outputBlobsWrappers.resize(ld.outputBlobs.size());
     MatShape prevShape = shape(ld.outputBlobs[pin.oid]);
+    Mat blob_ = blob.getMat();
     bool oldShape = prevShape == shape(blob_);
     if (oldShape)
     {
@@ -2136,8 +2298,6 @@ int64 Net::getPerfProfile(std::vector<double>& timings)
 
 //////////////////////////////////////////////////////////////////////////
 
-Importer::~Importer() {}
-
 Layer::Layer() { preferableTarget = DNN_TARGET_CPU; }
 
 Layer::Layer(const LayerParams &params)
@@ -2308,6 +2468,10 @@ void Layer::forward_fallback(InputArrayOfArrays inputs_arr, OutputArrayOfArrays 
         inputs[i] = &inpvec[i];
 
     this->forward(inputs, outputs, internals);
+
+    // sync results back
+    outputs_arr.assign(outputs);
+    internals_arr.assign(internals);
 }
 
 void Layer::run(const std::vector<Mat> &inputs, std::vector<Mat> &outputs, std::vector<Mat> &internals)
